@@ -1,4 +1,0 @@
-// ValveLogonVideo.rc : 内嵌开机登录前视频
-#include "Resource.h"
-
-IDR_VIDEO_RCDATA         RCDATA                  "rcdata1.bin"
