@@ -1,8 +1,0 @@
-<Solution>
-  <Configurations>
-    <Platform Name="x64" />
-    <Platform Name="x86" />
-  </Configurations>
-  <Project Path="Valve Boot/Valve Boot.vcxproj" Id="ff53b7f0-94b2-42b3-9731-45f1b80eb58d" />
-  <Project Path="ValveLogonVideo/ValveLogonVideo.vcxproj" Id="98deb984-1c7e-4531-b5d2-9d3296b416f9" />
-</Solution>
