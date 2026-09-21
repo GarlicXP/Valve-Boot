@@ -361,3 +361,6 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
+# 发布产物（dist 部署目录与压缩包不入库，磁盘上保留）
+dist/
+*.zip
