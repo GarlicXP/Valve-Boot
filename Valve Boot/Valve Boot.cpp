@@ -1,6 +1,8 @@
 ﻿// Valve Boot.cpp : 开机登录前视频的安装/卸载器。
 // 视频内嵌于 exe 用于本地预览；真正的登录前播放由 ValveLogonVideo.dll
 // （Credential Provider）在登录界面（Winlogon 桌面）完成。
+// 安装时：注册 DLL、关闭系统锁屏界面、创建 videos 文件夹与 config.ini；
+// 登录前播放支持多视频顺序/随机轮播（详见 config.ini 与使用说明）。
 //
 
 #include <windows.h>
@@ -9,6 +11,7 @@
 #include <cwchar>
 #include <shlwapi.h>
 #include <mmsystem.h>
+#include <winreg.h>
 
 #pragma comment(lib, "strmiids.lib")
 #pragma comment(lib, "ole32.lib")
@@ -147,6 +150,31 @@ void DeleteStartupTask()
     std::wstring taskName = L"ValveBootStartupVideo";
     std::wstring args = L"/delete /tn \"" + taskName + L"\" /f";
     RunSchtasksCommand(args);
+}
+
+// 注册视频同步器开机自启（HKLM Run，每次登录后启动，后台检查 GitHub 更新）
+// 注册视频同步器开机自启：计划任务（登录时以最高权限运行，无 UAC 弹窗）
+// 使更新器能够静默完成登录前视频 DLL 注册与软件自更新；同时移除旧版 Run 键防双启动
+void AddUpdateAutostart(const std::wstring& exeDir)
+{
+    std::wstring updater = exeDir + L"\\ValveVideoUpdater.exe";
+    if (GetFileAttributesW(updater.c_str()) == INVALID_FILE_ATTRIBUTES)
+        return;   // 没有同步器文件则不注册
+    std::wstring taskName = L"ValveBootVideoUpdater";
+    std::wstring args = L"/Create /TN \"" + taskName +
+        L"\" /TR \"\\\"" + updater + L"\\\"\" /SC ONLOGON /RL HIGHEST /F";
+    RunSchtasksCommand(args);
+    RegDeleteKeyValueW(HKEY_LOCAL_MACHINE,
+        L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", L"ValveVideoUpdater");
+}
+void RemoveUpdateAutostart()
+{
+    RunSchtasksCommand(L"/Delete /TN \"ValveBootVideoUpdater\" /F");
+    RegDeleteKeyValueW(HKEY_LOCAL_MACHINE,
+        L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
+        L"ValveVideoUpdater");
+    // 结束正在运行的后台同步器
+    system("taskkill /IM ValveVideoUpdater.exe /F >nul 2>&1");
 }
 
 // 启动音频服务并等待就绪
@@ -410,10 +438,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
         }
         // 清理旧的、无效的开机计划任务（SYSTEM 在 Session 0 运行，登录前无法显示）
         DeleteStartupTask();
+        // 移除视频同步器开机自启（并结束后台进程）
+        RemoveUpdateAutostart();
         // 注销登录前视频 Credential Provider
         std::wstring dllPath = GetExeDirectory() + L"\\ValveLogonVideo.dll";
         if (GetFileAttributesW(dllPath.c_str()) != INVALID_FILE_ATTRIBUTES)
             UnregisterLogonProvider(dllPath);
+        // 恢复 Windows 锁屏界面（安装时被关闭）
+        RegDeleteKeyValueW(HKEY_LOCAL_MACHINE,
+            L"SOFTWARE\\Policies\\Microsoft\\Windows\\Personalization", L"NoLockScreen");
         MessageBoxW(nullptr, L"登录前视频已取消。", L"Valve Boot", MB_OK | MB_ICONINFORMATION);
         return 0;
     }
@@ -436,29 +469,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
         return result;
     }
 
-    // 设置模式：先播放预览，再安装登录前视频（Credential Provider）
-    std::wstring tempVideo = ExtractVideoResource();
-    if (tempVideo.empty())
-    {
-        tempVideo = GetExeDirectory() + L"\\startup.wmv";
-        if (GetFileAttributesW(tempVideo.c_str()) == INVALID_FILE_ATTRIBUTES)
-        {
-            MessageBoxW(nullptr, L"找不到视频文件，无法播放。", L"Valve Boot", MB_OK | MB_ICONERROR);
-            return 1;
-        }
-    }
-
-    int playResult = RunPlaybackMode(tempVideo);
-
-    if (tempVideo.find(L"ValveBoot_startup.wmv") != std::wstring::npos)
-        DeleteFileW(tempVideo.c_str());
-
-    if (playResult != 0)
-    {
-        MessageBoxW(nullptr, L"视频播放失败，无法继续安装。", L"Valve Boot", MB_OK | MB_ICONERROR);
-        return playResult;
-    }
-
+    // 设置模式：一键注册（不预览动画），直接完成全部安装
+    // 预览请用 /play 参数（Valve Boot.exe /play）
     if (!IsRunAsAdmin())
     {
         WCHAR exePath[MAX_PATH];
@@ -478,7 +490,48 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
         return 1;
     }
     if (RegisterLogonProvider(dllPath))
-        MessageBoxW(nullptr, L"登录前视频已设置成功！下次开机在登录界面会先播放视频。", L"Valve Boot", MB_OK | MB_ICONINFORMATION);
+    {
+        // 关闭 Windows 锁屏界面：开机时 LockScreen（壁纸+时钟）会在登录前闪现，
+        // 凭据提供程序无法在它之前运行，只能用系统策略关闭。
+        DWORD dwOne = 1;
+        RegSetKeyValueW(HKEY_LOCAL_MACHINE,
+            L"SOFTWARE\\Policies\\Microsoft\\Windows\\Personalization",
+            L"NoLockScreen", REG_DWORD, &dwOne, sizeof(dwOne));
+
+        // 创建视频文件夹（多视频轮播）与默认配置文件（可热修改，无需重编译）
+        std::wstring exeDir = GetExeDirectory();
+        CreateDirectoryW((exeDir + L"\\videos").c_str(), nullptr);
+        std::wstring iniPath = exeDir + L"\\config.ini";
+        if (GetFileAttributesW(iniPath.c_str()) == INVALID_FILE_ATTRIBUTES)
+        {
+            WritePrivateProfileStringW(L"Video", L"Mode", L"sequential", iniPath.c_str());
+            WritePrivateProfileStringW(L"Video", L"VideoFolder", L"videos", iniPath.c_str());
+            WritePrivateProfileStringW(L"Video", L"HoldMs", L"60000", iniPath.c_str());
+        }
+        // 补齐 [Update] 段默认值（GitHub 视频自动同步），已有配置不动
+        {
+            wchar_t tmp[32] = { 0 };
+            GetPrivateProfileStringW(L"Update", L"Enabled", L"", tmp, 32, iniPath.c_str());
+            if (tmp[0] == 0)
+            {
+                WritePrivateProfileStringW(L"Update", L"Enabled", L"1", iniPath.c_str());
+                WritePrivateProfileStringW(L"Update", L"Repo", L"GarlicXP/Valve-Boot", iniPath.c_str());
+                WritePrivateProfileStringW(L"Update", L"RepoFolder", L"video", iniPath.c_str());
+                WritePrivateProfileStringW(L"Update", L"IntervalMin", L"30", iniPath.c_str());
+            }
+        }
+        // 注册视频同步器开机自启（登录后后台检查 GitHub video 文件夹）
+        AddUpdateAutostart(exeDir);
+
+        MessageBoxW(nullptr,
+            L"登录前视频已设置成功！\n"
+            L"· 将视频文件放入 videos 文件夹（wmv/mp4/avi/mkv/mov/mpg，每次开机播放一个）\n"
+            L"· 编辑 config.ini 可切换顺序/随机模式（默认顺序循环）\n"
+            L"· 已关闭系统锁屏界面，避免开机闪现\n"
+            L"· 已启用 GitHub 自动同步：每次登录后及每 30 分钟检查一次仓库 video 文件夹，\n"
+            L"  新增/变化的视频会自动下载到本目录 videos（下一轮开机生效）",
+            L"Valve Boot", MB_OK | MB_ICONINFORMATION);
+    }
     else
         MessageBoxW(nullptr, L"登录前视频安装失败。", L"Valve Boot", MB_OK | MB_ICONERROR);
     return 0;

@@ -5,4 +5,5 @@
   </Configurations>
   <Project Path="Valve Boot/Valve Boot.vcxproj" Id="ff53b7f0-94b2-42b3-9731-45f1b80eb58d" />
   <Project Path="ValveLogonVideo/ValveLogonVideo.vcxproj" Id="98deb984-1c7e-4531-b5d2-9d3296b416f9" />
+  <Project Path="ValveVideoUpdater/ValveVideoUpdater.vcxproj" Id="b14e9a62-4c5f-4e1b-9d2a-7f0c3a5d6e87" />
 </Solution>
