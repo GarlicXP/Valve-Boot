@@ -115,6 +115,7 @@ struct IPolicyConfigVista : public IUnknown
 
 HINSTANCE g_hInst = nullptr;
 
+static BOOL g_dpiAwareOk = FALSE;   // 进程 DPI 感知是否成功（决定全屏度量来源）
 static float g_volBefore = -1.f;   // 播放前主音量（-1=未快照）
 static BOOL  g_muteBefore = FALSE; // 播放前静音状态
 static volatile LONG g_activeThreads = 0;   // 正在播放视频的线程数（用于 DllCanUnloadNow）
@@ -219,6 +220,7 @@ static void EnsureDpiAware()
     }
     if (!ok)
         ok = SetProcessDPIAware();
+    g_dpiAwareOk = ok;
     VLog(L"[播放] DPI 感知设置 %s", ok ? L"成功" : L"失败（沿用宿主）");
 }
 
@@ -233,13 +235,36 @@ static HWND CreateVideoWindow()
     wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
     RegisterClass(&wc);
 
-    // 虚拟屏幕范围：单显示器=主屏全屏；多显示器=覆盖全部屏幕
-    int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
-    int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
-    int w  = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-    int h  = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-    if (w <= 0 || h <= 0) { w = GetSystemMetrics(SM_CXSCREEN); h = GetSystemMetrics(SM_CYSCREEN); vx = 0; vy = 0; }
-    VLog(L"[播放] 全屏尺寸 %dx%d @(%d,%d)", w, h, vx, vy);
+    // 全屏尺寸来源：DPI 感知成功时用虚拟屏幕（物理像素，覆盖全部显示器）；
+    // DPI 感知失败时（宿主进程已被其他模块锁定感知状态，某些设备会这样）
+    // GetSystemMetrics 返回逻辑分辨率（如 4K@200%% -> 1920x1080），窗口只占
+    // 左上角一小块。此时改用 EnumDisplaySettings 取物理分辨率（与 DPI 无关）。
+    int vx = 0, vy = 0, w = 0, h = 0;
+    if (g_dpiAwareOk)
+    {
+        vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        w  = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        h  = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    }
+    if (w <= 0 || h <= 0)
+    {
+        DEVMODEW dm = { sizeof(dm) };
+        if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm) &&
+            dm.dmPelsWidth > 0 && dm.dmPelsHeight > 0)
+        {
+            w = (int)dm.dmPelsWidth;
+            h = (int)dm.dmPelsHeight;
+        }
+        else
+        {
+            w = GetSystemMetrics(SM_CXSCREEN);
+            h = GetSystemMetrics(SM_CYSCREEN);
+        }
+        vx = 0; vy = 0;
+    }
+    VLog(L"[播放] 全屏尺寸 %dx%d @(%d,%d)（DPI感知=%s）", w, h, vx, vy,
+        g_dpiAwareOk ? L"成功" : L"失败(物理兜底)");
 
     // WS_EX_NOACTIVATE：窗口永不激活、不抢占键盘焦点，登录框保持可用
     return CreateWindowExW(
@@ -2060,10 +2085,23 @@ static DWORD WINAPI VideoThreadProc(LPVOID lpParam)
     }
     if (hwnd && IsWindow(hwnd))
     {
-        PickedVideo pick = SelectVideo(cfg);
-        bTempVideo = pick.path.empty();   // 内嵌视频 -> Temp 副本（可删）；文件夹源文件 -> 保留
-        vpath = bTempVideo ? ExtractVideoResource() : pick.path;
-        VLog(L"[播放] 选择视频：%s", vpath.c_str());
+        // 调试开关：环境变量 VALVEBOOT_PLAY_FILE=完整路径 强制播放指定文件
+        //（用于排查单个视频能否在登录前 DirectShow 渲染；不设置时走正常选片）
+        wchar_t wDbg[1024] = { 0 };
+        DWORD nDbg = GetEnvironmentVariableW(L"VALVEBOOT_PLAY_FILE", wDbg, 1024);
+        if (nDbg > 0 && nDbg < 1024 && GetFileAttributesW(wDbg) != INVALID_FILE_ATTRIBUTES)
+        {
+            vpath = wDbg;
+            bTempVideo = false;   // 调试指定文件：源文件绝不删
+            VLog(L"[播放] 调试指定视频：%s", vpath.c_str());
+        }
+        else
+        {
+            PickedVideo pick = SelectVideo(cfg);
+            bTempVideo = pick.path.empty();   // 内嵌视频 -> Temp 副本（可删）；文件夹源文件 -> 保留
+            vpath = bTempVideo ? ExtractVideoResource() : pick.path;
+            VLog(L"[播放] 选择视频：%s", vpath.c_str());
+        }
     }
     IGraphBuilder* pGraph = nullptr;
     IMediaControl* pControl = nullptr;
@@ -2308,7 +2346,9 @@ static DWORD WINAPI VideoThreadProc(LPVOID lpParam)
         }
         else if (FAILED(hr))
         {
-            VLog(L"[播放] 建图最终失败 0x%08X，跳过播放", hr);
+            VLog(L"[播放] 建图最终失败 0x%08X，跳过播放（设备可能缺少 WMV 解码器，"
+                 L"Windows N 版需安装媒体功能包）", hr);
+            if (hwnd && IsWindow(hwnd)) ShowWindow(hwnd, SW_HIDE);   // 不黑屏挡登录，露出登录界面
         }
     }
 
